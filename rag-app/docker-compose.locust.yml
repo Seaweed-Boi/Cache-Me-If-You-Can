@@ -1,0 +1,37 @@
+version: '3.8'
+
+# Docker Compose configuration for running Locust on a separate server
+# Usage: docker-compose -f docker-compose.locust.yml up -d
+#
+# Prerequisites:
+# 1. Set RAG_APP_HOST environment variable to point to your RAG app server
+#    Example: export RAG_APP_HOST=http://your-rag-server:8000
+# 2. Ensure the locustfile.py is present in the same directory
+
+services:
+  # Locust - Load testing service
+  locust:
+    image: locustio/locust:latest
+    container_name: locust
+    ports:
+      - "8089:8089"  # Locust web UI
+    volumes:
+      # Mount the locustfile
+      - ./locustfile.py:/home/locust/locustfile.py
+    # Run locust with the web UI available but DO NOT autostart a test.
+    # Start tests manually from the web UI at http://localhost:8089
+    # 
+    # The --host parameter should point to your RAG app server
+    # You can override this with the RAG_APP_HOST environment variable
+    command: >
+      -f /home/locust/locustfile.py
+      --host=${RAG_APP_HOST:-http://localhost:8000}
+      --web-host=0.0.0.0
+      --web-port=8089
+    environment:
+      - LOCUST_MODE=standalone
+    restart: unless-stopped
+
+networks:
+  default:
+    name: locust-network

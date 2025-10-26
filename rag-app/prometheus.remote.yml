@@ -1,0 +1,49 @@
+# Prometheus configuration for RAG application monitoring (Remote Server)
+# This configuration is for running Prometheus on a separate server
+# 
+# IMPORTANT: Update the 'targets' below to point to your actual RAG app server
+# Replace 'your-rag-server-ip:8000' with the actual IP address or hostname
+
+global:
+  scrape_interval: 15s      # Scrape metrics every 15 seconds
+  evaluation_interval: 15s  # Evaluate rules every 15 seconds
+  external_labels:
+    monitor: 'rag-app-monitor'
+
+# Alertmanager configuration (optional)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: []
+
+# Load rules once and periodically evaluate them according to the global 'evaluation_interval'
+rule_files:
+  # - "alert_rules.yml"
+
+# Scrape configurations
+scrape_configs:
+  # Scrape the RAG FastAPI application metrics
+  - job_name: 'rag-api'
+    static_configs:
+      # IMPORTANT: Update this target to point to your RAG app server
+      # Examples:
+      #   - targets: ['192.168.1.100:8000']  # Using IP address
+      #   - targets: ['rag-server.example.com:8000']  # Using hostname
+      - targets: ['your-rag-server-ip:8000']
+        labels:
+          service: 'rag-api'
+          environment: 'production'
+    
+    # Scrape the /metrics endpoint
+    metrics_path: '/metrics'
+    
+    # Scrape interval for this job (overrides global)
+    scrape_interval: 10s
+    scrape_timeout: 5s
+
+  # Scrape Prometheus itself for monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+        labels:
+          service: 'prometheus'
