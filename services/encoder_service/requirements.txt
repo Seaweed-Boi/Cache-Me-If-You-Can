@@ -1,6 +1,4 @@
-fastapi
-uvicorn
 python-dotenv
 sentence-transformers
 numpy
-redis
+redis[asyncio]

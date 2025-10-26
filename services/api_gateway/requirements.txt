@@ -2,7 +2,7 @@ fastapi
 uvicorn
 pydantic
 requests
-redis
+redis[asyncio]
 python-dotenv
 gunicorn
 prometheus-client

@@ -1,140 +1,125 @@
-import os
-import numpy as np
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from dotenv import load_dotenv
-import logging
-
+"""
+Encoder Service Worker - Continuous job processor
+Pops jobs from job:encoder_in, encodes text to vectors, pushes to job:retriever_in
+"""
 import os
 import time
 import json
 import asyncio
 import numpy as np
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 from dotenv import load_dotenv
-from typing import Any, Dict
-
-# We'll lazily import heavy libs inside functions to avoid startup crashes in constrained
-# environments. This module runs both an HTTP /encode endpoint and a background
-# Redis-backed worker that listens on `job:encoder_in` and writes to `job:retriever_in`.
+from redis import asyncio as aioredis
 
 load_dotenv()
+
 MODEL_NAME = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 VECTOR_DIMENSION = int(os.getenv("VECTOR_DIMENSION", 384))
 EMBEDDING_DEVICE = os.getenv("EMBEDDING_DEVICE", "cpu")
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+QUEUE_IN = "job:encoder_in"
+QUEUE_OUT = "job:retriever_in"
 
-app = FastAPI(title="Encoder Service")
-
-
-class QueryRequest(BaseModel):
-    text: str
-
-
-class VectorResponse(BaseModel):
-    vector: list[float]
-    dim: int = VECTOR_DIMENSION
-
-
-def get_redis_client():
-    try:
-        import redis
-
-        return redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=False)
-    except Exception:
-        return None
+# Global model instance
+_model = None
 
 
 def load_model():
-    # Lazy import model
-    try:
-        from sentence_transformers import SentenceTransformer
-
-        model = SentenceTransformer(MODEL_NAME, device=EMBEDDING_DEVICE)
-        return model
-    except Exception:
-        return None
-
-
-@app.get("/health")
-async def health_check():
-    m = load_model()
-    if m is None:
-        raise HTTPException(status_code=503, detail="Model not initialized")
-    return {"status": "ok", "model": MODEL_NAME}
+    """Load the sentence transformer model"""
+    global _model
+    if _model is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+            print(f"Loading model: {MODEL_NAME}")
+            _model = SentenceTransformer(MODEL_NAME, device=EMBEDDING_DEVICE)
+            print(f"✓ Model loaded successfully")
+        except Exception as e:
+            print(f"Failed to load model: {e}")
+            raise
+    return _model
 
 
-@app.post("/encode", response_model=VectorResponse)
-async def encode_query(request: QueryRequest):
-    m = load_model()
-    if m is None:
-        raise HTTPException(status_code=503, detail="Model unavailable")
-    if not request.text or request.text.strip() == "":
-        raise HTTPException(status_code=400, detail="Input text cannot be empty")
-    try:
-        embedding = m.encode(request.text, convert_to_tensor=False)
-        return VectorResponse(vector=embedding.tolist(), dim=getattr(embedding, "shape", (len(embedding),))[0])
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to generate embedding: {exc}")
-
-
-async def encoder_worker_loop(poll_interval: float = 1.0):
-    """Background loop: BRPOP from job:encoder_in, encode text, push to job:retriever_in."""
-    redis = get_redis_client()
-    if redis is None:
-        print("Encoder worker: redis client unavailable, exiting worker loop")
-        return
-
-    # Load model once
+def encode_text(text: str) -> np.ndarray:
+    """Encode text to vector embedding"""
     model = load_model()
-    if model is None:
-        print("Encoder worker: model could not be loaded; worker will retry every 10s")
+    embedding = model.encode(text, convert_to_numpy=True)
+    return embedding
+
+
+async def worker_loop():
+    """
+    Main worker loop - continuously process encoding jobs
+    
+    Flow:
+    1. Pop job from job:encoder_in (blocking)
+    2. Encode the text to vector
+    3. Push enhanced job to job:retriever_in
+    """
+    # Connect to Redis
+    redis = await aioredis.from_url(
+        f"redis://{REDIS_HOST}:{REDIS_PORT}",
+        decode_responses=True
+    )
+    
+    print(f"Encoder worker started, listening on {QUEUE_IN}")
+    
+    # Load model once at startup
+    load_model()
+    
     while True:
         try:
-            item = redis.brpop("job:encoder_in", timeout=5)
-            if not item:
-                await asyncio.sleep(poll_interval)
+            # Blocking pop from input queue (timeout 5 seconds)
+            result = await redis.brpop(QUEUE_IN, timeout=5)
+            
+            if not result:
+                # Timeout, no job available
+                await asyncio.sleep(0.1)
                 continue
-
-            _, raw = item
-            try:
-                job = json.loads(raw)
-            except Exception:
-                # if raw bytes already, try decode
-                try:
-                    job = json.loads(raw.decode())
-                except Exception:
-                    print("Encoder worker: invalid job payload, skipping")
-                    continue
-
-            text = job.get("text") or job.get("query")
+            
+            _, job_data = result
+            job = json.loads(job_data)
+            
             job_id = job.get("job_id")
-            if not text or not job_id:
-                print("Encoder worker: job missing text or job_id, skipping")
+            text = job.get("text") or job.get("query")
+            
+            if not job_id or not text:
+                print(f"Invalid job, missing job_id or text: {job}")
                 continue
+            
+            print(f"[{job_id}] Encoding text: {text[:50]}...")
+            
+            # Encode the text
+            start_time = time.time()
+            embedding = encode_text(text)
+            encode_time = (time.time() - start_time) * 1000
+            
+            print(f"[{job_id}] Encoded in {encode_time:.1f}ms, vector dim: {len(embedding)}")
+            
+            # Add embedding to job payload
+            job["embedding"] = embedding.tolist()
+            job["encode_time_ms"] = encode_time
+            
+            # Push to retriever queue
+            await redis.lpush(QUEUE_OUT, json.dumps(job))
+            print(f"[{job_id}] Pushed to {QUEUE_OUT}")
+            
+        except json.JSONDecodeError as e:
+            print(f"JSON decode error: {e}")
+        except Exception as e:
+            print(f"Worker error: {e}")
+            await asyncio.sleep(1)
 
-            # Ensure model is loaded
-            if model is None:
-                model = load_model()
-                if model is None:
-                    # push an error status to completion and skip
-                    redis.set(f"job:completion:{job_id}", json.dumps({"error": "model unavailable"}))
-                    continue
 
-            vec = model.encode(text, convert_to_tensor=False)
-            # Use the key `query` for the original text so downstream services (retriever)
-            # which expect `query` (per the RAGJob model) can validate/parse the payload.
-            payload = {"job_id": job_id, "vector": vec.tolist(), "query": text, "selected_replica": job.get("selected_replica")}
-            redis.lpush("job:retriever_in", json.dumps(payload))
-        except Exception as exc:
-            print(f"Encoder worker loop error: {exc}")
-            await asyncio.sleep(5)
+async def main():
+    """Entry point"""
+    try:
+        await worker_loop()
+    except KeyboardInterrupt:
+        print("\nShutting down encoder worker")
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        raise
 
 
-@app.on_event("startup")
-async def startup_event():
-    # Start background encoder worker loop
-    asyncio.create_task(encoder_worker_loop())
-
+if __name__ == "__main__":
+    asyncio.run(main())
